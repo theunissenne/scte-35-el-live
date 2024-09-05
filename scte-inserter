@@ -1,0 +1,187 @@
+#!/usr/bin/python
+# coding=utf-8
+# ---------------------------------------------------------------------------
+# This script creates a SCTE35 segmentation descriptor that can be used in
+# REST API calls of AWS Elemental Live for time_signal SCTE35 messages.
+#
+# ---------------------------------------------------------------------------
+#  © 2017 Elemental Technologies or its affiliates.  All rights reserved.
+#  AWS Elemental Confidential
+# ---------------------------------------------------------------------------
+#
+# ***************************************************************************
+# *** START OF SCRIPT *******************************************************
+# ***************************************************************************
+
+import datetime
+import math
+import hashlib
+import requests
+import os
+
+segmentation_vars_defaults = {
+    "segmentation_event_id": "237294",
+    "format_identifier": "DPG0",
+    "private_data": "b69e2ef8-e861-4e31-b9bb-7ac584b3420c",
+    "delivery_not_restricted": "1",
+    "web_delivery_allowed": "1",
+    "no_regional_blackout": "1",
+    "archive_allowed": "1",
+    "device_restrictions": "3", # device restrictions 3 means no restriction (11) see scte specs
+    "segmentation_duration": f'{90000 * 30}',  # calculated as 90 000 khz per s, so 90 000 equals 1s. Leave blank if
+    # no duration should be defined.
+    "segmentation_upid_type": "12",  # always chose MPU as segmentation type
+    "segmentation_type": "34",
+}
+
+
+def create_segmentation_descriptor(seg_vars):
+    splice_descriptor_tag = '02'
+    descriptor_body = ""
+    descriptor_length = None
+
+    # Segmentation_event_id is always CUEI which is the ASCII value and translates to 43554549 in hex
+    # the event_id should be 32 bit long. Which is 4 bytes.
+    # hex each character has 4 bits, so we need a hex of length 8.
+    # When converting the hex string this means 0:08X (which translate to a 8 byte hex minus the 0x part)
+    # The 7F stands for the segmentation_event_cancel_indicator (1bit), segmentation_event_id_compliance_indicator (1bit), and 6 reservered bits
+    # Reserved bits are implied to have value 1 unless otherwise specified.
+    # 7F translates to 01111111 which means 0 flag for cancel indicater, 1 for compliance indicator, the rest is 1 for reserved bits
+    identifier = 'CUEI'.encode('utf-8').hex()
+    event_id = '{0:08X}'.format(int(seg_vars['segmentation_event_id']))
+    segmentation_event_cancel_indicator = int(0 << 7)
+    segmentation_event_id_compliance_indicator = int(1 << 6)
+    reserved = int(0b111111)
+    identifier_event_id = identifier + event_id + '{0:02X}'.format(int(segmentation_event_cancel_indicator + segmentation_event_id_compliance_indicator + reserved))
+
+    flags = None
+    segmentation_upid_length = None
+    segmentation_upid_type = None
+    result = None
+
+    # The order of the flags;
+    # program_segmentation_flag 1bit
+    # segmentation_duration_flag 1 bit
+    # delivery_not_restricted_flag 1 bit
+    # web_delivery_allowed_flag 1 bit
+    # no_regional_blackout_flag 1 bit
+    # archive_allowed_flag 1 bit
+    # device_restrictions_flag 2 bit
+    # together they form exactly one byte
+    # the first value should be shifted 7 to the left (to represent the first bit of the byte) e.g. 10000000 is 128
+    # the second should be shifted by 6 01000000 is 64 and so on
+    program_segmentation_flag = 128  # 1 << 7 (is 1 bit shifted 7 to the left to complete the byte
+    if seg_vars["segmentation_duration"] != u"" or seg_vars["segmentation_duration"] != "":
+        if int(seg_vars["segmentation_duration"]) > 0:
+            print("hell yeah")
+            print(int(seg_vars["segmentation_duration"]))
+            segmentation_duration_flag = 1 << 6  # 64
+            # segmentation_duration
+            # 40 bit (5 bytes) long, each hex contains 4 bits, so we need a hex op 10
+            segmentation_duration = "{0:0{1}X}".format(int(seg_vars["segmentation_duration"]), 10)
+        else:
+            segmentation_duration_flag = 0
+            segmentation_duration = ""
+    else:
+        segmentation_duration_flag = 0
+        segmentation_duration = ""
+
+    print(f'segmentation duration flag is {segmentation_duration_flag} and duration is {segmentation_duration}')
+    delivery_not_restricted_flag = int(seg_vars["delivery_not_restricted"]) << 5
+    web_delivery_allowed_flag = int(seg_vars["web_delivery_allowed"]) << 4
+    no_regional_blackout_flag = int(seg_vars["no_regional_blackout"]) << 3
+    archive_allowed_flag = int(seg_vars["archive_allowed"]) << 2
+    device_restrictions_flag = int(seg_vars["device_restrictions"])
+
+    # Add all above flags to form 1 byte value, which is a 2 char hex (length 2)
+    flags_int = program_segmentation_flag + segmentation_duration_flag + delivery_not_restricted_flag + \
+                web_delivery_allowed_flag + no_regional_blackout_flag + \
+                archive_allowed_flag + device_restrictions_flag
+    flags = "{0:02X}".format(flags_int)
+
+    # segmentation upid_type is an 8 bit (1byte) value. Which translate to an hex of 2 byte.
+    # For allow values check the SCTE35 spec.
+    # We will ALWAYS use type MPU is 12, which defines a custom identifier (MPU) so we can pass on private data.
+    # For MPU we need to provide the segmentation_upid, which is a variable length string.
+    # upid type is a 8 bit value or 2 hex value. The value should be 12 for MPU
+    segmentation_upid_type = "{0:02X}".format(int(seg_vars["segmentation_upid_type"]))
+    print(f'segmenation upid type is {segmentation_upid_type}')
+
+    # Unique Program ID. Should contain 4 letters, each letter is convert to a 2 digit hex value.
+    # Making a total of 8 hex values or 32 bits.
+    # The private data is can be Nx8 bits long and provides the opportunity to insert custom string like a UUID.
+    format_identifier = "".join(["{0:02X}".format(int(ord(x))) for x in seg_vars["format_identifier"]])
+    private_data = seg_vars["private_data"].encode("utf-8").hex()
+    segmentation_upid = format_identifier + private_data
+    segmentation_upid_length_tmp = int(len(segmentation_upid) / 2) # hex value is has twice the length of original string.
+    segmentation_upid_length = "{0:02X}".format(segmentation_upid_length_tmp)
+
+    # segmentation_type_id is an 8 bit value or 2 hex value. The value should be 34 for Provider Placement Opportunity Start
+    # and 36 for Provider Placement Opportunity End
+    # 34 breakstart and 35 breakend
+    segmentation_type = "{0:02X}".format(int(seg_vars["segmentation_type"]))
+
+    # Still not sure how this works
+    if segmentation_type in ['34', '36']:
+        segmentation_type += '00000000'
+    elif segmentation_type in ['10', '11', '12', '13', '14', '15', '16', '17', '19', '20', '21', '24', '25', '26',
+                               '27']:
+        segmentation_type += '0101'
+    else:
+        segmentation_type += '0000'
+
+    descriptor_body = identifier_event_id + flags + segmentation_duration + segmentation_upid_type + \
+                      segmentation_upid_length + segmentation_upid + segmentation_type
+
+    # 43554549{0:08X}7F == 18 chars after event_id substitution
+    tmp = 18 + len(flags) + len(segmentation_duration) + len(segmentation_upid_type) + len(segmentation_upid_length) + \
+          len(segmentation_upid) + len(segmentation_type)
+
+    descriptor_length = "{0:02X}".format(int(tmp / 2))  # 2 chars per byte
+    result = splice_descriptor_tag + descriptor_length + descriptor_body
+    print("YOUR SCTE35 SEGMENTATION DESCRIPTOR: " + result)
+    return result
+
+
+def generate_elemental_header(api_key, request_path, application_type):
+    api_user = "admin"
+    date_now = datetime.datetime.now().timestamp()
+    time_stamp = date_now + 30 * 100
+    current_ts = math.floor(time_stamp)
+
+    hashed_aws = hashlib.md5(f"{request_path}{api_user}{api_key}{current_ts}".encode()).hexdigest()
+    md5_header = hashlib.md5(f"{api_key}{hashed_aws}".encode()).hexdigest()
+
+    return {
+        "X-Auth-User": api_user,
+        "X-Auth-Expires": f"{current_ts}",
+        "X-Auth-Key": md5_header,
+        "Content-Type": application_type,
+        "Accept": application_type
+    }
+
+
+api_key = os.environ['API_KEY']
+def insert_scte():
+    live_event_id = 109
+    base_url = "https://10.25.29.132"
+    r_path = f'/api/live_events/{live_event_id}/time_signal'
+    url = f'{base_url}{r_path}'
+    headers = generate_elemental_header(api_key, r_path, "application/xml")
+
+    current_date = datetime.datetime.now()
+    response = requests.post(url,
+                             headers=headers,
+                             verify=False,
+                             data=f'''
+                  <time_signal>
+                    <offset>4000</offset>
+                    <descriptors>
+                        {create_segmentation_descriptor(segmentation_vars_defaults)}
+                    </descriptors>
+                  </time_signal>'''
+                             )
+    print(response.text)
+
+
+insert_scte()
